@@ -38,7 +38,7 @@ jobs:
           encoded = pathlib.Path('Anima-iPad-source-only.zip.b64')
           assert encoded.stat().st_size <= 2 * 1024**2, 'Unexpected source text size'
           data = base64.b64decode(encoded.read_bytes().strip(b'\r\n'), validate=True)
-          expected = 'a53d353f6a0b42ef055ce7f6be063472a4a7cc30f2dfb366b0880173399ee561'
+          expected = 'ea725b6471d8b4ff796453f62b3b40ced095d3f1d751c31a489cb714f21b8f23'
           assert hashlib.sha256(data).hexdigest() == expected, 'Source ZIP hash mismatch'
           destination = pathlib.Path('source-only')
           assert not destination.exists(), 'Extraction directory must be absent'
