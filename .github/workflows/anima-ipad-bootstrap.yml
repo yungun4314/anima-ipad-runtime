@@ -1,0 +1,107 @@
+# Manual template only. This file does not create a repository or start a run.
+name: Anima iPad code-only build
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Mac runner (check your account quota/cost before dispatch)
+        required: true
+        default: macos-15
+        type: choice
+        options:
+          - macos-15
+          - macos-15-intel
+permissions:
+  contents: read
+concurrency:
+  group: anima-manual-build
+  cancel-in-progress: false
+jobs:
+  unsigned-code-only:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 330
+    env:
+      NCPU: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    defaults:
+      run:
+        working-directory: source-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Decode and verify the exact source ZIP and extract safely
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, io, pathlib, stat, unicodedata, zipfile
+          encoded = pathlib.Path('Anima-iPad-source-only.zip.b64')
+          assert encoded.stat().st_size <= 2 * 1024**2, 'Unexpected source text size'
+          data = base64.b64decode(encoded.read_bytes().strip(b'\r\n'), validate=True)
+          expected = 'f668064a0698f86189bfdc749d911c544759786b5a031625136d8b0708e7f162'
+          assert hashlib.sha256(data).hexdigest() == expected, 'Source ZIP hash mismatch'
+          destination = pathlib.Path('source-only')
+          assert not destination.exists(), 'Extraction directory must be absent'
+          with zipfile.ZipFile(io.BytesIO(data)) as source:
+              members = source.infolist()
+              assert len(members) == 48, 'Unexpected source file count'
+              assert sum(item.file_size for item in members) < 8 * 1024**2, 'Unexpected source size'
+              names = set()
+              for item in members:
+                  name = item.filename
+                  path = pathlib.PurePosixPath(name)
+                  assert name and not path.is_absolute() and '\\' not in name and ':' not in name, 'Unsafe source path'
+                  assert all(part not in ('', '.', '..') for part in name.split('/')), 'Unsafe path segment'
+                  assert not item.is_dir() and not item.flag_bits & 1, 'Unexpected archive member'
+                  mode = item.external_attr >> 16
+                  assert stat.S_IFMT(mode) == stat.S_IFREG, 'Unexpected symlink or special file'
+                  folded = unicodedata.normalize('NFC', name).casefold()
+                  assert folded not in names, 'Duplicate source path'
+                  names.add(folded)
+                  assert item.file_size <= 2 * 1024**2, 'Oversized source file'
+              destination.mkdir()
+              for item in members:
+                  target = destination.joinpath(*pathlib.PurePosixPath(item.filename).parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with target.open('xb') as stream:
+                      stream.write(source.read(item))
+                  target.chmod(0o644)
+          print('Exact source ZIP verified and extracted; no private game data was supplied.')
+          PY
+      - name: Verify source-only package and available space
+        run: |
+          python3 Anima_iPad/build/cloud/verify_source_only.py
+          python3 - <<'PY'
+          import shutil
+          free = shutil.disk_usage('.').free
+          print(f'Available disk bytes: {free}')
+          assert free >= 12 * 1024**3, 'At least 12 GiB free is required; actual build may need more.'
+          PY
+          xcodebuild -version
+      - name: Prepare build tools on this temporary runner
+        run: |
+          brew install python@3.11 bison pkg-config gettext glib-utils libgpg-error nasm make meson ninja pixman
+          "$(brew --prefix python@3.11)/bin/python3.11" -m venv "$RUNNER_TEMP/anima-venv"
+          "$RUNNER_TEMP/anima-venv/bin/python3" -m pip install six pyparsing setuptools
+          echo "$RUNNER_TEMP/anima-venv/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix glib-utils)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix libgpg-error)/bin" >> "$GITHUB_PATH"
+      - name: Fetch pinned public sources and apply reviewed changes
+        run: bash Anima_iPad/build/build-macos.sh prepare
+      - name: Test storage code on the native Mac
+        run: swift test --package-path Anima_iPad/app
+      - name: Compile and test the new QEMU devices on the native Mac first
+        run: bash Anima_iPad/build/native-qtest-macos.sh
+      - name: Compile custom Android interpreter engine
+        run: bash Anima_iPad/build/build-macos.sh engine
+      - name: Compile unsigned app code without private game data
+        run: bash Anima_iPad/build/build-macos.sh app-code
+      - name: Return unsigned code for local payload assembly
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Anima-unsigned-needs-payload
+          path: source-only/Anima_iPad/build/output/Anima-unsigned-needs-payload.ipa
+          if-no-files-found: error
+          retention-days: 3
