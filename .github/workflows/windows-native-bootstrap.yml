@@ -1,0 +1,366 @@
+# Publish this file under .github/workflows/ only when a Windows build is wanted.
+# Manual, source-only Windows diagnostic engine. No Android/APK/save input exists.
+# Official setup options: https://github.com/msys2/setup-msys2/tree/ec48f7c5447b3140e2b088413ae3a55687bccb6e
+# UCRT64: https://www.msys2.org/docs/environments/
+# QEMU Windows recipe: https://github.com/msys2/MINGW-packages/tree/master/mingw-w64-qemu
+name: Anima Windows native diagnostic engine
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: anima-windows-native
+  cancel-in-progress: false
+jobs:
+  windows-native:
+    # Standard runner; do not replace with a paid larger runner.
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      MSYS: winsymlinks:deepcopy
+      SOURCE_ZIP_SHA256: a53d353f6a0b42ef055ce7f6be063472a4a7cc30f2dfb366b0880173399ee561
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Decode the exact v7 source package before installing build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import base64, hashlib, io, os, pathlib, stat, unicodedata, zipfile
+          encoded = pathlib.Path('Anima-iPad-source-only.zip.b64')
+          assert encoded.stat().st_size <= 2 * 1024**2, 'Unexpected source text size'
+          data = base64.b64decode(encoded.read_bytes().strip(b'\r\n'), validate=True)
+          assert len(data) == 136266, 'Unexpected source ZIP size'
+          assert hashlib.sha256(data).hexdigest() == os.environ['SOURCE_ZIP_SHA256'], 'Source ZIP hash mismatch'
+          destination = pathlib.Path('source-only')
+          assert not destination.exists(), 'Extraction directory must be absent'
+          with zipfile.ZipFile(io.BytesIO(data)) as source:
+              members = source.infolist()
+              assert len(members) == 48, 'Unexpected source file count'
+              assert sum(item.file_size for item in members) < 8 * 1024**2, 'Unexpected source size'
+              names = set()
+              for item in members:
+                  name = item.filename
+                  path = pathlib.PurePosixPath(name)
+                  assert name and not path.is_absolute() and '\\' not in name and ':' not in name, 'Unsafe source path'
+                  assert all(part not in ('', '.', '..') for part in name.split('/')), 'Unsafe path segment'
+                  assert not item.is_dir() and not item.flag_bits & 1, 'Unexpected archive member'
+                  assert stat.S_IFMT(item.external_attr >> 16) == stat.S_IFREG, 'Unexpected symlink or special file'
+                  folded = unicodedata.normalize('NFC', name).casefold()
+                  assert folded not in names, 'Duplicate source path'
+                  names.add(folded)
+                  assert item.file_size <= 2 * 1024**2, 'Oversized source file'
+              destination.mkdir()
+              for item in members:
+                  target = destination.joinpath(*pathlib.PurePosixPath(item.filename).parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with target.open('xb') as stream:
+                      stream.write(source.read(item))
+          print('Exact source ZIP verified; no private game data was supplied.')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Source decode failed.' }
+          Push-Location source-only
+          try {
+            python Anima_iPad/build/cloud/verify_source_only.py
+            if ($LASTEXITCODE -ne 0) { throw 'Source manifest failed.' }
+          } finally { Pop-Location }
+      - name: Prepare official MSYS2 UCRT64 tools on the temporary runner
+        id: msys2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        with:
+          msystem: UCRT64
+          path-type: minimal
+          release: true
+          update: true
+          cache: false
+          install: >-
+            base-devel
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-python-setuptools
+            mingw-w64-ucrt-x86_64-python-distlib
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-dtc
+            mingw-w64-ucrt-x86_64-zlib
+      - name: Record the compiler and signed rolling repository package versions
+        shell: msys2 {0}
+        working-directory: source-only
+        run: |
+          set -euo pipefail
+          mkdir -p Anima_iPad/build/windows-logs
+          test "$MSYSTEM" = UCRT64
+          command -v gcc python3 ninja pkg-config
+          python3 -c 'import os, sys, shutil, distlib.scripts, distlib.version; assert os.name == "nt"; assert hasattr(distlib.version, "LegacyMatcher"); assert shutil.disk_usage(".").free >= 10 * 1024**3; print(sys.executable, sys.version)'
+          # The Action and QEMU sources are pinned. MSYS2 package repositories roll;
+          # this is an execution record, not a claim of fully locked dependencies.
+          pacman -Q > Anima_iPad/build/windows-logs/msys2-packages.txt
+          gcc --version > Anima_iPad/build/windows-logs/compiler.txt
+          python3 --version > Anima_iPad/build/windows-logs/python.txt
+          pkg-config --modversion glib-2.0 pixman-1 > Anima_iPad/build/windows-logs/libraries.txt
+      - name: Fetch hash-locked public sources and restore internal source links as copies
+        shell: msys2 {0}
+        working-directory: source-only
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' 2>&1 | tee Anima_iPad/build/windows-logs/source-preparation.txt
+          import importlib.util, json, pathlib, posixpath, shutil, tarfile
+          build = pathlib.Path('Anima_iPad/build').resolve()
+          spec = importlib.util.spec_from_file_location('anima_public_sources', build / 'sources.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          for component in ('utm', 'qemu'):
+              locked = module.LOCK[component]
+              archive = module.fetch(locked)
+              root = module.extract(locked).resolve()
+              # Windows extraction deliberately skips Unix links. Materialize only
+              # validated, existing targets in this same public source tree. No
+              # administrator privilege or Windows Developer Mode is required.
+              with tarfile.open(archive, 'r:*') as tar:
+                  links = {}
+                  for member in tar.getmembers():
+                      known = locked.get('omittedExternalLinks', {}).get(member.name)
+                      if known is not None and member.issym() and member.linkname == known:
+                          continue
+                      module.validate_member(member, locked['directory'])
+                      if member.issym() or member.islnk():
+                          links[member.name] = member
+              restored = set()
+              active = set()
+              def restore(name):
+                  if name in restored:
+                      return
+                  assert name not in active, 'Cyclic source link'
+                  active.add(name)
+                  member = links[name]
+                  target_name = posixpath.normpath(posixpath.join(posixpath.dirname(name), member.linkname) if member.issym() else member.linkname)
+                  if target_name in links:
+                      restore(target_name)
+                  for child in links:
+                      if child.startswith(target_name.rstrip('/') + '/'):
+                          restore(child)
+                  source = root.parent.joinpath(*pathlib.PurePosixPath(target_name).parts).resolve(strict=True)
+                  target = root.parent.joinpath(*pathlib.PurePosixPath(name).parts)
+                  assert source.is_relative_to(root), 'Escaping source link refused'
+                  assert target.parent.resolve().is_relative_to(root), 'Escaping link destination refused'
+                  assert not target.exists() and not target.is_symlink(), 'Existing source preserved'
+                  if source.is_dir():
+                      shutil.copytree(source, target)
+                  else:
+                      assert source.is_file(), 'Special source link refused'
+                      shutil.copyfile(source, target)
+                  active.remove(name)
+                  restored.add(name)
+              for name in links:
+                  restore(name)
+              stamp_path = root / '.anima-source.json'
+              stamp = json.loads(stamp_path.read_text())
+              stamp.update(mode='windows-native-build-links-materialized', omittedLinks=[], materializedLinks=sorted(restored))
+              stamp_path.write_text(json.dumps(stamp, indent=2) + '\n', encoding='utf-8')
+              print(component, locked['sha256'], 'internal links materialized:', len(restored))
+          PY
+          build="$PWD/Anima_iPad/build"
+          qemu="$build/sources/qemu-10.0.2-utm"
+          utm="$build/sources/UTM-3de3c4a183203a10b1c8981dd351a0df6cfee95d"
+          python3 - <<'PY'
+          import hashlib, json, pathlib
+          build = pathlib.Path('Anima_iPad/build')
+          lock = json.loads((build / 'sources.lock.json').read_text())
+          patch = build / 'sources' / lock['utm']['directory'] / lock['qemu']['utmPatch']
+          assert hashlib.sha256(patch.read_bytes()).hexdigest() == lock['qemu']['utmPatchSha256'], 'UTM patch hash mismatch'
+          PY
+          git -C "$qemu" apply --check "$utm/patches/qemu-10.0.2-utm.patch"
+          git -C "$qemu" apply "$utm/patches/qemu-10.0.2-utm.patch"
+          python3 Anima_iPad/engine/apply_qemu_overlay.py "$qemu" | tee Anima_iPad/build/windows-logs/overlay.txt
+          python3 Anima_iPad/engine/apply_qemu_overlay.py "$qemu" --check-only
+      - name: Configure and compile the native ARM interpreter and device tests
+        shell: msys2 {0}
+        working-directory: source-only
+        run: |
+          set -euo pipefail
+          build="$PWD/Anima_iPad/build"
+          qemu="$build/sources/qemu-10.0.2-utm"
+          native="$build/windows-native"
+          mkdir "$native"
+          cd "$native"
+          # No SDL/SPICE/network helper or dynamically loaded QEMU module is built.
+          # The headless binary accepts local QMP for screenshots and input later.
+          bash "$qemu/configure" \
+            --target-list=aarch64-softmmu --without-default-features \
+            --enable-system --enable-tcg --enable-tcg-interpreter --enable-pixman \
+            --enable-fdt=system --disable-download --disable-docs --disable-tools \
+            --disable-user --disable-werror --disable-shared-lib --disable-modules \
+            --disable-guest-agent --disable-plugins \
+            2>&1 | tee "$build/windows-logs/configure.txt"
+          ninja -j 2 qemu-system-aarch64.exe tests/qtest/anima-goldfish-test.exe \
+            2>&1 | tee "$build/windows-logs/compile.txt"
+      - name: Run native device tests without an Android disk
+        shell: msys2 {0}
+        working-directory: source-only
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          build="$PWD/Anima_iPad/build"
+          native="$build/windows-native"
+          export TMP="$(cygpath -m "$RUNNER_TEMP")"
+          export TEMP="$TMP"
+          export TMPDIR="$TMP"
+          export QTEST_QEMU_BINARY="$(cygpath -m "$native/qemu-system-aarch64.exe")"
+          "$native/tests/qtest/anima-goldfish-test.exe" \
+            2>&1 | tee "$build/windows-logs/device-tests.txt"
+          "$native/qemu-system-aarch64.exe" -machine help > "$build/windows-logs/machines.txt"
+          grep -E '^anima-ranchu[[:space:]]' "$build/windows-logs/machines.txt"
+          "$native/qemu-system-aarch64.exe" -version > "$build/windows-logs/qemu-version.txt"
+      - name: Collect the EXE and its complete UCRT64 DLL dependency closure
+        shell: msys2 {0}
+        working-directory: source-only
+        run: |
+          set -euo pipefail
+          export ANIMA_UCRT_ROOT="$(cygpath -m /ucrt64)"
+          export ANIMA_MSYS_ROOT="$(cygpath -m /)"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, subprocess
+          build = pathlib.Path('Anima_iPad/build').resolve()
+          ucrt = pathlib.Path(os.environ['ANIMA_UCRT_ROOT']).resolve()
+          msys = pathlib.Path(os.environ['ANIMA_MSYS_ROOT']).resolve()
+          objdump = ucrt / 'bin/objdump.exe'
+          pacman = msys / 'usr/bin/pacman.exe'
+          output = build / 'windows-output/Anima-Windows-native'
+          output.mkdir(parents=True, exist_ok=False)
+          executable = build / 'windows-native/qemu-system-aarch64.exe'
+          shutil.copyfile(executable, output / executable.name)
+          available = {path.name.casefold(): path for path in (ucrt / 'bin').glob('*.dll')}
+          system_names = set('advapi32.dll avrt.dll bcrypt.dll cfgmgr32.dll comctl32.dll comdlg32.dll crypt32.dll dbghelp.dll dnsapi.dll dwmapi.dll dxgi.dll gdi32.dll imm32.dll iphlpapi.dll kernel32.dll mpr.dll msvcrt.dll ncrypt.dll netapi32.dll ntdll.dll ole32.dll oleaut32.dll powrprof.dll propsys.dll psapi.dll rpcrt4.dll secur32.dll setupapi.dll shell32.dll shlwapi.dll synchronization.dll ucrtbase.dll user32.dll userenv.dll version.dll winmm.dll winspool.drv ws2_32.dll wtsapi32.dll'.split())
+          queue = [output / executable.name]
+          visited = set()
+          imports = {}
+          owners = set()
+          while queue:
+              binary = queue.pop()
+              key = binary.name.casefold()
+              if key in visited:
+                  continue
+              visited.add(key)
+              result = subprocess.run([str(objdump), '-p', str(binary)], check=True, text=True, capture_output=True)
+              assert 'pei-x86-64' in result.stdout, 'Unexpected binary architecture'
+              dependencies = re.findall(r'^\s*DLL Name:\s*(\S+)\s*$', result.stdout, re.MULTILINE)
+              assert dependencies, 'No PE imports found'
+              imports[binary.name] = sorted(dependencies)
+              for name in dependencies:
+                  lower = name.casefold()
+                  assert pathlib.PureWindowsPath(name).name == name and ':' not in name, 'Unsafe DLL name'
+                  assert lower != 'msys-2.0.dll', 'The portable engine must not depend on MSYS'
+                  if lower in available:
+                      source = available[lower]
+                      target = output / source.name
+                      if not target.exists():
+                          shutil.copyfile(source, target)
+                          owner = subprocess.run([str(pacman), '-Qoq', '/ucrt64/bin/' + source.name], check=True, text=True, capture_output=True).stdout.strip()
+                          assert owner.startswith('mingw-w64-ucrt-x86_64-') and '\n' not in owner, 'Unexpected DLL package owner'
+                          owners.add(owner)
+                      queue.append(target)
+                  else:
+                      assert lower in system_names or lower.startswith(('api-ms-win-', 'ext-ms-win-')), 'Unresolved DLL: ' + name
+          licenses = output / 'licenses'
+          licenses.mkdir()
+          qemu = build / 'sources/qemu-10.0.2-utm'
+          for name in ('COPYING', 'COPYING.LIB'):
+              shutil.copyfile(qemu / name, licenses / ('QEMU-' + name))
+          for owner in sorted(owners):
+              listing = subprocess.run([str(pacman), '-Qlq', owner], check=True, text=True, capture_output=True).stdout.splitlines()
+              for name in listing:
+                  prefix = '/ucrt64/share/licenses/'
+                  if name.startswith(prefix) and not name.endswith('/'):
+                      source = msys.joinpath(*pathlib.PurePosixPath(name.lstrip('/')).parts)
+                      if source.is_file():
+                          target = licenses / 'MSYS2' / name[len(prefix):]
+                          target.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copyfile(source, target)
+          lock = json.loads((build / 'sources.lock.json').read_text())
+          source_notes = output / 'source-changes'
+          shutil.copytree(build.parent / 'engine/overlay', source_notes / 'overlay')
+          shutil.copytree(build.parent / 'engine/upstream/qemu', source_notes / 'upstream/qemu')
+          shutil.copyfile(build.parent / 'engine/apply_qemu_overlay.py', source_notes / 'apply_qemu_overlay.py')
+          shutil.copyfile(build / 'sources.lock.json', source_notes / 'sources.lock.json')
+          shutil.copyfile(build / 'sources' / lock['utm']['directory'] / lock['qemu']['utmPatch'], source_notes / 'qemu-10.0.2-utm.patch')
+          shutil.copytree(build / 'windows-logs', output / 'build-record')
+          report = {
+              'sourceZipSha256': os.environ['SOURCE_ZIP_SHA256'],
+              'qemuSourceSha256': lock['qemu']['sha256'],
+              'qemuCommit': lock['qemu']['commit'],
+              'msys2ActionCommit': 'ec48f7c5447b3140e2b088413ae3a55687bccb6e',
+              'msys2DependenciesFullyLocked': False,
+              'runner': os.environ.get('ImageOS'),
+              'runnerImageVersion': os.environ.get('ImageVersion'),
+              'repository': os.environ.get('GITHUB_REPOSITORY'),
+              'workflowCommit': os.environ.get('GITHUB_SHA'),
+              'runId': os.environ.get('GITHUB_RUN_ID'),
+              'dllImports': imports, 'dllPackageOwners': sorted(owners),
+              'nativeDeviceTestsPassed': True, 'guestBootTested': False,
+              'iPadExecutionTested': False, 'privateGameDataIncluded': False,
+              'windowsCodeSigned': False,
+          }
+          (output / 'BUILD-RESULT.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+          (output / 'README.txt').write_text(
+              'Anima Windows native diagnostic engine (x86-64).\n'
+              'Built from pinned public QEMU/UTM sources and the Anima device overlay.\n'
+              'This unsigned EXE and its adjacent DLLs are a test engine, not an iPad app.\n'
+              'Device register tests passed; Android boot and gameplay are NOT tested by CI.\n'
+              'No APK, Android image, save, kernel, or personal data is included.\n'
+              'Keep all DLLs beside the EXE. No MSYS2 installation is required to run it.\n'
+              'From PowerShell in this folder: .\\qemu-system-aarch64.exe -version\n'
+              'Machine check: .\\qemu-system-aarch64.exe -machine help\n'
+              'Use local QMP/serial for diagnostics; no GUI frontend is included.\n'
+              'Only boot fresh private disk copies locally. Preserve the originals.\n'
+              'Corresponding public source URLs, hashes and overlay are in source-changes.\n'
+              'The source-only package remains available in the repository at workflowCommit.\n'
+              'Signed MSYS2 repository package versions are recorded in build-record.\n', encoding='utf-8')
+          hashes = {path.relative_to(output).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(output.rglob('*')) if path.is_file()}
+          (output / 'SHA256SUMS.json').write_text(json.dumps(hashes, indent=2) + '\n', encoding='utf-8')
+          print('Portable DLL closure:', sorted(visited))
+          PY
+      - name: Verify the portable engine from PowerShell with no MSYS2 on PATH
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bundle = Join-Path $env:GITHUB_WORKSPACE 'source-only/Anima_iPad/build/windows-output/Anima-Windows-native'
+          $engine = Join-Path $bundle 'qemu-system-aarch64.exe'
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          Push-Location $env:RUNNER_TEMP
+          try {
+            $version = & $engine -version 2>&1
+            if ($LASTEXITCODE -ne 0) { throw 'Portable engine version check failed.' }
+            $machines = & $engine -machine help 2>&1
+            if ($LASTEXITCODE -ne 0 -or -not ($machines -match '^anima-ranchu\s')) {
+              throw 'Portable engine does not expose anima-ranchu.'
+            }
+            Write-Output $version
+            Write-Output 'Portable EXE/DLL check passed; no Android boot was attempted.'
+          } finally { Pop-Location }
+      - name: Return the native diagnostic engine and required DLLs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Anima-Windows-native-v7-${{ github.run_id }}
+          path: source-only/Anima_iPad/build/windows-output/Anima-Windows-native/
+          if-no-files-found: error
+          retention-days: 3
+      - name: Preserve only public build diagnostics if a step fails
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Anima-Windows-build-logs-${{ github.run_id }}
+          path: |
+            source-only/Anima_iPad/build/windows-logs/
+            source-only/Anima_iPad/build/windows-native/config.log
+            source-only/Anima_iPad/build/windows-native/meson-logs/
+          if-no-files-found: warn
+          retention-days: 3
