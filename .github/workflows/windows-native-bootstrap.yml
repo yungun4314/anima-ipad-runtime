@@ -19,12 +19,12 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       MSYS: winsymlinks:deepcopy
-      SOURCE_ZIP_SHA256: a53d353f6a0b42ef055ce7f6be063472a4a7cc30f2dfb366b0880173399ee561
+      SOURCE_ZIP_SHA256: ea725b6471d8b4ff796453f62b3b40ced095d3f1d751c31a489cb714f21b8f23
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Decode the exact v7 source package before installing build tools
+      - name: Decode the exact v8 source package before installing build tools
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -33,7 +33,7 @@ jobs:
           encoded = pathlib.Path('Anima-iPad-source-only.zip.b64')
           assert encoded.stat().st_size <= 2 * 1024**2, 'Unexpected source text size'
           data = base64.b64decode(encoded.read_bytes().strip(b'\r\n'), validate=True)
-          assert len(data) == 136266, 'Unexpected source ZIP size'
+          assert len(data) == 136882, 'Unexpected source ZIP size'
           assert hashlib.sha256(data).hexdigest() == os.environ['SOURCE_ZIP_SHA256'], 'Source ZIP hash mismatch'
           destination = pathlib.Path('source-only')
           assert not destination.exists(), 'Extraction directory must be absent'
@@ -361,7 +361,7 @@ jobs:
       - name: Return the native diagnostic engine and required DLLs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: Anima-Windows-native-v7-${{ github.run_id }}
+          name: Anima-Windows-native-v8-${{ github.run_id }}
           path: source-only/Anima_iPad/build/windows-output/Anima-Windows-native/
           if-no-files-found: error
           retention-days: 3
